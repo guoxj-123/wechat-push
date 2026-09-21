@@ -1,0 +1,33 @@
+# ⚠️ 凭据安全说明
+#
+# 本 skill 的真实凭据存放在用户主目录的 ~/.workbuddy/settings.json，
+# 不在本仓库路径内，因此 git 天然不会收录它。
+# 下面仍显式列出相关模式，用于兜底：万一有人在本地把配置/日志复制进本目录，
+# 也不会被误提交。
+#
+# 首次上传前请执行：
+#   git status --ignored
+# 并确认没有任何含 botToken / userId 的文件被跟踪。
+
+# WorkBuddy 配置与运行时产物（含凭据、状态、调试日志）
+# 注意：不要写裸的 `settings.json` —— 该模式无斜杠时会在任意层级匹配，
+# 若仓库日后新增同名文件（如 docs/settings.json 示例）会被误忽略。
+**/settings.json
+*.settings.json
+*.state.json
+*.lock
+wb-push.state.json
+wb-audit-watch.state.json
+wb-audit-watch.lock
+wb-audit-watch.log
+wb-push.debug.log
+
+# 通用
+*.bak
+*.bak-*
+*.log
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
