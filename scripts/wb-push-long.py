@@ -69,37 +69,126 @@ def find_node():
     )
 
 
-def split_text(text, maxlen):
-    """按空行切成段落，贪心合并到每段 <= maxlen；超长段落再硬切。"""
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+# 条目起始行：有序列表 "1. xxx" / "1、xxx" / 无序 "- xxx" / "• xxx"
+ITEM_START_RE = re.compile(r"^\s*(?:\d+\s*[.、)]|[-*•])\s+")
 
-    chunks = []
-    for p in paragraphs:
-        while len(p) > maxlen:  # 单段超长，按句子/标点回退切分
-            cut = p.rfind("。", 0, maxlen)
+
+def _split_items_into_blocks(text, maxlen):
+    """条目感知切分：条目为原子单位，绝不从条目内部截断。
+
+    规则：
+      1. 逐行扫描；遇到条目起始行（`1. ` / `- ` 等）则开启新条目，
+         其后的续行（缩进或不以标记开头）归入当前条目。
+      2. 非条目行（标题、普通段落）各自成为独立块。
+      3. 贪心合并块到每段 <= maxlen；放不下就把**整个块**移到下一段。
+      4. 仅当单个块自身超长（罕见：一条资讯长达上千字）时，
+         才按句号边界拆该块，并打上续接标记，明确告知读者这是同一条的延续。
+    """
+    lines = text.splitlines()
+    blocks = []          # [(kind, content)]，kind 为 'item' 或 'plain'
+    cur, cur_kind = [], None
+
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped:
+            # 空行：结束当前块
+            if cur:
+                blocks.append((cur_kind, "\n".join(cur).strip()))
+                cur, cur_kind = [], None
+            continue
+        is_item = bool(ITEM_START_RE.match(ln))
+        if is_item:
+            if cur:
+                blocks.append((cur_kind, "\n".join(cur).strip()))
+            cur, cur_kind = [ln], "item"
+        else:
+            if cur_kind == "item":
+                cur.append(ln)          # 条目续行
+            elif cur:
+                cur.append(ln)
+            else:
+                cur, cur_kind = [ln], "plain"
+    if cur:
+        blocks.append((cur_kind, "\n".join(cur).strip()))
+
+    # 块内超长才降级拆分（打续接标记，避免读者误以为是新条目或新消息）
+    normalized = []
+    for kind, blk in blocks:
+        if len(blk) <= maxlen:
+            normalized.append((kind, blk, False))
+            continue
+        rest, first = blk, True
+        while len(rest) > maxlen:
+            cut = rest.rfind("。", 0, maxlen)
             if cut < maxlen * 0.5:
-                cut = p.rfind("\n", 0, maxlen)
+                cut = rest.rfind("\n", 0, maxlen)
             if cut < maxlen * 0.5:
                 cut = maxlen
             else:
                 cut += 1
-            chunks.append(p[:cut].strip())
-            p = p[cut:].strip()
-        if p:
-            chunks.append(p)
+            normalized.append((kind, rest[:cut].strip(), not first))
+            rest = rest[cut:].strip()
+            first = False
+        if rest:
+            normalized.append((kind, rest, not first))
 
-    groups, cur = [], ""
-    for c in chunks:
-        if not cur:
-            cur = c
-        elif len(cur) + 2 + len(c) <= maxlen:
-            cur = cur + "\n\n" + c
+    # 小标题单独成块会白白浪费一段，把它吸附到紧邻的下一块头部；
+    # 但吸附后若超过 maxlen，则放弃吸附（宁可标题单独成段，也不超限）。
+    merged = []
+    for kind, blk, is_cont in normalized:
+        if (merged and merged[-1][2] is False and _is_heading(merged[-1][1])
+                and len(merged[-1][1]) + 1 + len(blk) <= maxlen):
+            k0, b0, c0 = merged.pop()
+            merged.append((kind, b0 + "\n" + blk, is_cont))
         else:
-            groups.append(cur)
-            cur = c
-    if cur:
-        groups.append(cur)
+            merged.append((kind, blk, is_cont))
+
+    groups, cur_group, cur_len = [], [], 0
+    for kind, blk, is_cont in merged:
+        # 兜底：块自身仍超限（吸附合并可能导致），按句号边界再拆一次，
+        # 避免整段突破 wb-push.js 的 1500 字符硬上限被静默截断。
+        pieces = _hard_split(blk, maxlen) if len(blk) > maxlen else [blk]
+        for pi, piece in enumerate(pieces):
+            if is_cont or pi > 0:
+                piece = "（接上条）" + piece
+            add = len(piece) + (2 if cur_group else 0)
+            if cur_group and cur_len + add > maxlen:
+                groups.append("\n\n".join(cur_group))
+                cur_group, cur_len = [piece], len(piece)
+            else:
+                cur_group.append(piece)
+                cur_len += add
+    if cur_group:
+        groups.append("\n\n".join(cur_group))
     return groups
+
+
+def _hard_split(blk, maxlen):
+    """按句号/换行边界把超长块拆成 <=maxlen 的若干片（最后兜底才硬切）。"""
+    pieces, rest = [], blk
+    while len(rest) > maxlen:
+        cut = rest.rfind("。", 0, maxlen)
+        if cut < maxlen * 0.5:
+            cut = rest.rfind("\n", 0, maxlen)
+        if cut < maxlen * 0.5:
+            cut = maxlen
+        else:
+            cut += 1
+        pieces.append(rest[:cut].strip())
+        rest = rest[cut:].strip()
+    if rest:
+        pieces.append(rest)
+    return pieces
+
+
+def _is_heading(line):
+    """是否为 Markdown 小标题（仅认 # 开头的行，避免误吸普通短行）。"""
+    return line.strip().startswith("#")
+
+
+def split_text(text, maxlen):
+    """分段入口：条目感知切分（条目为原子单位，不夹断）。"""
+    return _split_items_into_blocks(text, maxlen)
 
 
 def main():
@@ -120,10 +209,20 @@ def main():
         sys.exit("文件内容为空")
 
     lines = text.splitlines()
-    title = args.title or (lines[0].strip() if lines else "WorkBuddy 通知")
-    body = text
-    if not args.title and lines:
-        body = text[len(lines[0]):].strip() or text
+    first = lines[0].strip() if lines else ""
+    if args.title:
+        # 显式给了标题：若正文首行是摘要/标题性质的短行（非列表、非 # 标题），
+        # 视为与消息标题重复，从正文中剥离，避免「标题 + 正文首行摘要」双份。
+        title = args.title
+        body = text
+        if first and not _is_heading(first) and not ITEM_START_RE.match(first) and len(first) <= 80:
+            body = text[len(lines[0]):].strip() or text
+    else:
+        # 未给标题：取正文首行作标题，并从正文中剥离该行。
+        title = first or "WorkBuddy 通知"
+        body = text[len(lines[0]):].strip() if lines else text
+        if not body:
+            body = text
 
     groups = split_text(body, args.max)
     total = len(groups)

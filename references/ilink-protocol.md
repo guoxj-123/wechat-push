@@ -179,7 +179,7 @@ POST /ilink/bot/getupdates
 | errcode | errmsg | 含义 | 处理 |
 |---------|--------|------|------|
 | 0 | — | 成功（可能不带 `message_id`） | — |
-| -14 | `session timeout` | botToken 无效 / 已过期，或登录态失效 | 先让用户给 bot 发条消息；仍失败则重新扫码绑定 |
+| -14 | `session timeout` | botToken 无效 / 已过期，或登录态失效。**也会在「请求头里的 token 不是字符串」时出现**——例如 WorkBuddy 5.6+ 的 `settings.json` 把 `botToken` 存成 `$wbEncrypted` 信封，脚本未识别就拼出了 `Bearer [object Object]`，此时错误文案会误导排查方向 | 先确认凭据解析来源（`wb-push.js --cred-status`），别急着重新扫码；若确为凭据过期，再让用户给 bot 发条消息，仍失败才重新扫码绑定 |
 
 对照示例（payload 与请求头**完全同构**，唯一变量是 botToken 是否有效）：
 

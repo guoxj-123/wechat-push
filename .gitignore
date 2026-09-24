@@ -16,11 +16,14 @@
 *.settings.json
 *.state.json
 *.lock
+*.credentials.json
+wb-push.credentials.json
 wb-push.state.json
 wb-audit-watch.state.json
 wb-audit-watch.lock
 wb-audit-watch.log
 wb-push.debug.log
+**/claw-state/
 
 # 通用
 *.bak

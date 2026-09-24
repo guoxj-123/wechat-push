@@ -10,11 +10,32 @@
  *   node wb-push.js --send "<标题>" "<内容>"
  *   内容也支持从 stdin 读取
  *
+ * 用法3（凭据与投递诊断）:
+ *   node wb-push.js --cred-status           # 诊断凭据解析路径（不打印密钥）
+ *   node wb-push.js --session-status        # 探测会话活跃度（getconfig），判断能否真正投递
+ *   node wb-push.js --set-token "<token>" [userId]   # 手动写入本地凭据缓存
+ *   node wb-push.js --recover-token         # 从 claw-state/历史 settings.json* 回收明文 token
+ *
  * 微信 ClawBot 通道：
- *   凭据自动从 ~/.workbuddy/settings.json 的 claw.users.*.channels.weixinClawBot 读取
- *   （botToken / userId / baseUrl）。也可用环境变量覆盖：
- *   WBPUSH_WX_TOKEN / WBPUSH_WX_USER / WBPUSH_WX_BASE
  *   协议：POST {base}/ilink/bot/sendmessage（与 WorkBuddy 内置 WeixinClawBotClient 一致）
+ *   凭据解析顺序（先命中先用）：
+ *     1) 环境变量 WBPUSH_WX_TOKEN / WBPUSH_WX_USER / WBPUSH_WX_BASE
+ *        （可选 WBPUSH_WX_CONTEXT_TOKEN，被动回复场景需要）
+ *     2) 本地凭据缓存 ~/.workbuddy/wb-push.credentials.json（0600）
+ *     3) ~/.workbuddy/settings.json 中的明文凭据（旧版客户端仍为明文）
+ *     4) claw-state 长轮询游标 ~/.workbuddy/claw-state/weixin/<accountId>_im.bot.cursor.json
+ *        该文件内嵌当前绑定的 <accountId>@im.bot:<hex> 身份串（于 get_updates_buf 的
+ *        base64 里），格式与 botToken 同构，由客户端每轮 getupdates 刷新——无需解密，
+ *        且天然跟随重新绑定（文件名即账号），是加密客户端下最可靠的自动来源。
+ *     5) 自动恢复：从历史 settings.json* 备份回收最新的明文 botToken（仅当账号一致）
+ *
+ *   ⚠️ WorkBuddy 5.6+ 把 settings.json 的 botToken / channelId 改为加密信封
+ *      {"$wbEncrypted":1,"envelope":"<base64>"}。密钥由客户端原生层
+ *      （WorkBuddy.exe!electron_browser_workbuddy_storage）在启动时通过
+ *      IPC 下发给 CLI，外部脚本无法获取，故无法解密。
+ *      旧版脚本会把对象直接拼进请求头，得到 "Bearer [object Object]"，iLink
+ *      返回误导性的 errcode=-14 session timeout。本版改为显式识别信封并报错，
+ *      并优先经第 4 条（claw-state）自动取得当前绑定的有效凭据。
  */
 
 const fs = require('fs');
@@ -23,29 +44,314 @@ const os = require('os');
 const crypto = require('crypto');
 
 // ---------- 凭据 ----------
-function loadWeixinCreds() {
-  const env = {
-    botToken: process.env.WBPUSH_WX_TOKEN || '',
-    userId: process.env.WBPUSH_WX_USER || '',
-    baseUrl: process.env.WBPUSH_WX_BASE || 'https://ilinkai.weixin.qq.com'
-  };
-  if (env.botToken && env.userId) return env;
+const WB_DIR = path.join(os.homedir(), '.workbuddy');
+const CRED_CACHE_FILE = path.join(WB_DIR, 'wb-push.credentials.json');
+const LIVE_SETTINGS_FILE = path.join(WB_DIR, 'settings.json');
+const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
+// botToken 形如 xxxxxxxxxxxx@im.bot:0a1b2c3d...（<accountId>:<hex>）
+const BOT_TOKEN_RE = /^[A-Za-z0-9_-]+@[A-Za-z0-9_.-]+:[0-9a-fA-F]{8,}$/;
+
+// 诊断信息（--cred-status 与错误信息用；绝不写入密钥本身）
+const credNotes = [];
+function note(msg) { credNotes.push(msg); }
+
+function isEncryptedEnvelope(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v) && v.$wbEncrypted !== undefined;
+}
+
+// 从指定 settings 文件里取 weixinClawBot 通道对象（不校验 enabled，便于备份回收）
+function readChannelFrom(file) {
+  let settings;
+  try { settings = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
+  const users = (settings.claw && settings.claw.users) ? settings.claw.users : {};
+  for (const uid of Object.keys(users)) {
+    const ch = users[uid] && users[uid].channels ? users[uid].channels.weixinClawBot : null;
+    if (ch) return ch;
+  }
+  return null;
+}
+
+function readCredCache() {
   try {
-    const sp = path.join(os.homedir(), '.workbuddy', 'settings.json');
-    const settings = JSON.parse(fs.readFileSync(sp, 'utf8'));
-    const users = settings.claw && settings.claw.users ? settings.claw.users : {};
-    for (const uid of Object.keys(users)) {
-      const ch = users[uid] && users[uid].channels ? users[uid].channels.weixinClawBot : null;
-      if (ch && ch.enabled && ch.botToken && ch.userId) {
-        return {
-          botToken: ch.botToken,
-          userId: ch.userId,
-          baseUrl: (ch.baseUrl || 'https://ilinkai.weixin.qq.com').replace(/\/$/, '')
-        };
-      }
+    const c = JSON.parse(fs.readFileSync(CRED_CACHE_FILE, 'utf8'));
+    if (c && typeof c.botToken === 'string') return c;
+  } catch (e) { /* 无缓存 */ }
+  return null;
+}
+
+function writeCredCache(obj) {
+  try {
+    fs.writeFileSync(CRED_CACHE_FILE, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    note('已写入凭据缓存 ' + CRED_CACHE_FILE);
+    return true;
+  } catch (e) {
+    note('凭据缓存写入失败: ' + e.message);
+    return false;
+  }
+}
+
+// 从历史 settings.json* 备份里回收最新的「明文」token。
+// 只接受与当前账号（accountId / channelId）一致的 token，避免回收成过期账号。
+function recoverFromBackups(expectedAccount) {
+  let files = [];
+  try {
+    files = fs.readdirSync(WB_DIR)
+      .filter((f) => /^settings\.json($|\.)/.test(f))
+      .map((f) => path.join(WB_DIR, f));
+  } catch (e) { return null; }
+  const cands = [];
+  for (const f of files) {
+    let ch, mtime;
+    try { mtime = fs.statSync(f).mtimeMs; } catch (e) { continue; }
+    ch = readChannelFrom(f);
+    if (!ch) continue;
+    const tok = ch.botToken;
+    if (typeof tok !== 'string' || !BOT_TOKEN_RE.test(tok)) continue;
+    if (expectedAccount && !tok.startsWith(expectedAccount + ':')) continue;
+    cands.push({ file: path.basename(f), mtime, botToken: tok, userId: ch.userId, baseUrl: ch.baseUrl });
+  }
+  if (!cands.length) return null;
+  cands.sort((a, b) => b.mtime - a.mtime);
+  return cands[0];
+}
+
+// ---------- claw-state 游标凭据回收（WorkBuddy 5.6+ 加密客户端下的主用来源） ----------
+// 客户端长轮询 getupdates 时会把 <accountId>@im.bot:<hex> 身份串写进
+// claw-state/weixin/<accountId>_im.bot.cursor.json 的 get_updates_buf（base64 包装）。
+// 该串与 botToken 同构、可直接用作 Bearer 凭据，且由客户端持续刷新，
+// 因此它既能自动跟随重新绑定，也不涉及任何解密。
+const CLAW_STATE_DIR = path.join(WB_DIR, 'claw-state', 'weixin');
+const CURSOR_TOKEN_RE = /[0-9a-fA-F]{6,}@[A-Za-z0-9_.-]+:[0-9a-fA-F]{8,}/g;
+const CURSOR_FILE_RE = /_im\.bot\.cursor\.json$/;
+
+function extractTokenFromCursor(file) {
+  try {
+    const c = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const raw = String(c.get_updates_buf || '');
+    if (!raw) return null;
+    const text = Buffer.from(raw, 'base64').toString('utf8');
+    const found = text.match(CURSOR_TOKEN_RE);
+    if (!found) return null;
+    for (const cand of found) if (BOT_TOKEN_RE.test(cand)) return cand;
+    return null;
+  } catch (e) { return null; }
+}
+
+// expectedAccount 形如 <botId>@im.bot；给了就只认同账号的游标文件，
+// 避免在重新绑定后误取旧账号凭据。
+function recoverFromClawState(expectedAccount) {
+  let files = [];
+  try {
+    files = fs.readdirSync(CLAW_STATE_DIR)
+      .filter((f) => CURSOR_FILE_RE.test(f))
+      .map((f) => path.join(CLAW_STATE_DIR, f));
+  } catch (e) { return null; }
+  const want = expectedAccount ? String(expectedAccount).split('@')[0] : '';
+  const cands = [];
+  for (const f of files) {
+    const base = path.basename(f);
+    if (want && !base.startsWith(want + '_')) continue;
+    let mtime;
+    try { mtime = fs.statSync(f).mtimeMs; } catch (e) { continue; }
+    const tok = extractTokenFromCursor(f);
+    if (!tok) continue;
+    if (expectedAccount && !tok.startsWith(expectedAccount + ':')) continue;
+    cands.push({ file: 'claw-state/weixin/' + base, mtime, botToken: tok });
+  }
+  if (!cands.length) return null;
+  cands.sort((a, b) => b.mtime - a.mtime);
+  return cands[0];
+}
+
+// 统一的「明文 token 回收」入口：先看 claw-state（当前绑定、时效最新），
+// 再退回历史 settings.json* 备份。供 loadWeixinCreds 与 --recover-token 共用。
+function recoverPlaintextToken(expectedAccount) {
+  const cs = recoverFromClawState(expectedAccount);
+  if (cs) return { ...cs, origin: 'claw-state' };
+  const bk = recoverFromBackups(expectedAccount);
+  if (bk) return { ...bk, origin: 'backup' };
+  return null;
+}
+
+// 会话活跃度探测（--session-status）：getconfig 的 ret 是「能否主动投递」的可靠判据。
+//   ret=0            → 会话活跃，主动推送可投递
+//   ret=-4           → 该 bot 下无活跃会话，主动推送会被静默丢弃（sendmessage 仍返回 message_id）
+//   errcode=-14      → 凭据本身无效（先跑 --cred-status）
+// 注意：requestDeliveries 只记录文件/产物投递，不能用来判断文本会话是否活跃。
+async function probeSession(creds) {
+  const body = JSON.stringify({
+    ilink_user_id: creds.userId,
+    base_info: { channel_version: CHANNEL_VERSION }
+  });
+  console.log('[wb-push] 会话探测（getconfig）:');
+  console.log('  凭据来源  : ' + creds.source);
+  console.log('  目标 userId: ' + (creds.userId || '(空)'));
+  console.log('  baseUrl   : ' + creds.baseUrl);
+  let res, txt, json = {};
+  try {
+    res = await fetch(creds.baseUrl + '/ilink/bot/getconfig', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        AuthorizationType: 'ilink_bot_token',
+        'Content-Length': String(Buffer.byteLength(body, 'utf-8')),
+        Authorization: 'Bearer ' + creds.botToken
+      },
+      body,
+      signal: AbortSignal.timeout(15000)
+    });
+    txt = await res.text();
+  } catch (e) {
+    console.log('  请求失败  : ' + e.message);
+    return 1;
+  }
+  try { json = JSON.parse(txt); } catch (e) { /* 非 JSON */ }
+  const ret = json.ret;
+  const authCode = json.errcode;
+  console.log('  返回值    : ' + 'ret=' + (ret === undefined ? '(缺失)' : ret) +
+    (authCode ? (' errcode=' + authCode) : '') + (json.errmsg ? (' errmsg=' + json.errmsg) : ''));
+  if (authCode === -14) {
+    console.log('  判定      : 凭据无效/已过期（鉴权层）→ 先用 --cred-status 确认凭据来源');
+    return 1;
+  }
+  if (ret === 0) {
+    console.log('  判定      : 会话活跃 → 主动推送可投递');
+    console.log('  typing_ticket: ' + (json.typing_ticket ? '已下发' : '未下发'));
+    return 0;
+  }
+  if (ret === -4) {
+    console.log('  判定      : 该 bot 下无活跃会话 → 主动推送会被静默丢弃（平台仍返回 message_id，退出码 0）');
+    console.log('  处置      : 让用户在微信里给 clawbot 发一条消息以建立/刷新会话；');
+    console.log('              若微信里找不到该会话，说明换绑未完成，需在 WorkBuddy 中重新扫码绑定');
+    return 1;
+  }
+  console.log('  判定      : 未识别的返回码，请对照 references/ilink-protocol.md 的错误码表');
+  return 1;
+}
+
+function loadWeixinCreds() {
+  credNotes.length = 0;
+  const baseUrlEnv = process.env.WBPUSH_WX_BASE || '';
+  const ctxToken = process.env.WBPUSH_WX_CONTEXT_TOKEN || '';
+
+  // 1) 环境变量
+  if (process.env.WBPUSH_WX_TOKEN && process.env.WBPUSH_WX_USER) {
+    return {
+      botToken: process.env.WBPUSH_WX_TOKEN,
+      userId: process.env.WBPUSH_WX_USER,
+      baseUrl: (baseUrlEnv || DEFAULT_BASE_URL).replace(/\/$/, ''),
+      contextToken: ctxToken,
+      source: 'env'
+    };
+  }
+
+  const live = readChannelFrom(LIVE_SETTINGS_FILE);
+  let liveAccount = '';
+  let liveUserId = '';
+  let liveBaseUrl = DEFAULT_BASE_URL;
+  let liveTokenState = 'missing';
+  if (live) {
+    liveAccount = typeof live.accountId === 'string' ? live.accountId
+      : (typeof live.channelId === 'string' ? live.channelId : '');
+    if (typeof live.userId === 'string') liveUserId = live.userId;
+    if (typeof live.baseUrl === 'string' && live.baseUrl) liveBaseUrl = live.baseUrl;
+    if (typeof live.botToken === 'string' && live.botToken) liveTokenState = 'plaintext';
+    else if (isEncryptedEnvelope(live.botToken)) liveTokenState = 'encrypted';
+  }
+  note('settings.json: token=' + liveTokenState + (live ? '' : ' (无 weixinClawBot 通道)'));
+
+  // 2) 本地凭据缓存
+  const cache = readCredCache();
+  if (cache && cache.botToken) {
+    if (!liveAccount || cache.botToken.startsWith(liveAccount + ':')) {
+      note('命中凭据缓存（' + (cache.source || 'unknown') + '，' + (cache.updatedAt || '无时间戳') + '）');
+      return {
+        botToken: cache.botToken,
+        userId: cache.userId || liveUserId,
+        baseUrl: (cache.baseUrl || liveBaseUrl).replace(/\/$/, ''),
+        contextToken: ctxToken || cache.contextToken || '',
+        source: 'cache'
+      };
     }
-  } catch (e) { /* 读取失败时仅使用环境变量 */ }
-  return env;
+    note('凭据缓存账号与当前账号不一致，已忽略');
+  }
+
+  // 3) settings.json 明文
+  if (liveTokenState === 'plaintext' && live && live.enabled !== false) {
+    note('使用 settings.json 明文凭据');
+    return {
+      botToken: live.botToken,
+      userId: liveUserId,
+      baseUrl: liveBaseUrl.replace(/\/$/, ''),
+      contextToken: ctxToken,
+      source: 'settings'
+    };
+  }
+
+  // 4) 自动回收：claw-state 游标优先（当前绑定、客户端持续刷新），其次历史备份
+  const rec = recoverPlaintextToken(liveAccount);
+  if (rec) {
+    const recUserId = rec.userId || liveUserId;
+    note('回收来源: ' + rec.file + '（' + rec.origin + '，mtime ' + new Date(rec.mtime).toISOString() + '）');
+    if (!recUserId) {
+      note('回收到的凭据缺 userId，且 settings.json 中亦无 userId，无法使用');
+    } else {
+      if (rec.origin === 'backup') {
+        // 备份是静态时点的，落缓存以备备份文件被清理后仍可用；
+        // claw-state 由客户端持续刷新，故不落缓存，避免制造陈旧副本。
+        writeCredCache({
+          botToken: rec.botToken,
+          userId: recUserId,
+          baseUrl: (rec.baseUrl || liveBaseUrl),
+          source: 'recovered:' + rec.file,
+          updatedAt: new Date().toISOString()
+        });
+      }
+      return {
+        botToken: rec.botToken,
+        userId: recUserId,
+        baseUrl: (rec.baseUrl || liveBaseUrl).replace(/\/$/, ''),
+        contextToken: ctxToken,
+        source: rec.origin + ':' + rec.file
+      };
+    }
+  }
+
+  if (liveTokenState === 'encrypted') {
+    note('settings.json 凭据为 $wbEncrypted 加密信封，外部脚本无法解密；claw-state 与历史备份中亦未找到可用明文 token');
+  }
+  return {
+    botToken: '',
+    userId: liveUserId,
+    baseUrl: liveBaseUrl.replace(/\/$/, ''),
+    contextToken: ctxToken,
+    source: 'none',
+    error:
+      '无法获得可用的微信 ClawBot 明文凭据。\n' +
+      'WorkBuddy 5.6+ 把 settings.json 里的 botToken 存成了加密信封（密钥在客户端原生层，脚本无法解密），\n' +
+      '本脚本的自动回收（claw-state 游标 → 历史备份）也都没找到与当前账号匹配的明文 token。\n' +
+      '解决方式（任选其一）：\n' +
+      '  A) 让 WorkBuddy 客户端保持运行并至少完成一轮消息轮询，再重试——这会刷新\n' +
+      '     ~/.workbuddy/claw-state/weixin/<accountId>_im.bot.cursor.json，脚本即可自动取到凭据；\n' +
+      '  B) 定时任务改用客户端原生开关：编辑任务 → 打开「推送到微信」，任务输出由平台直接投递，无需脚本；\n' +
+      '  C) 手动指定：WBPUSH_WX_TOKEN=<token> WBPUSH_WX_USER=<userId> node wb-push.js --send ...；\n' +
+      '     或 node wb-push.js --set-token "<token>" "<userId>" 写入本地凭据缓存；\n' +
+      '     或 node wb-push.js --recover-token 从 claw-state/历史备份回收（需账号一致）。'
+  };
+}
+
+// 打印凭据诊断（不含密钥）
+function printCredStatus(creds) {
+  const mask = (t) => (!t ? '(空)' : t.length <= 12 ? t : t.slice(0, 8) + '…' + t.slice(-4) + ' (len ' + t.length + ')');
+  console.log('[wb-push] 凭据解析路径:');
+  for (const n of credNotes) console.log('  - ' + n);
+  console.log('  最终来源: ' + creds.source);
+  console.log('  botToken: ' + mask(creds.botToken));
+  console.log('  userId  : ' + (creds.userId || '(空)'));
+  console.log('  baseUrl : ' + creds.baseUrl);
+  console.log('  context : ' + (creds.contextToken ? '有' : '无'));
+  if (!creds.botToken) console.log('\n' + creds.error);
+  return !!creds.botToken;
 }
 
 // ---------- 工具 ----------
@@ -74,9 +380,16 @@ function randomWechatUin() {
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // 把 iLink 的错误码翻译成「下一步该怎么做」。未收录的错误码返回空串，保持原始信息不干扰排查。
+// 实测口径（2026-09-24 用有效凭据逐项探测）：
+//   errcode=-14 鉴权层：凭据无效/过期；或请求头里塞了非字符串 token（如 [object Object]）
+//   ret=-2      参数层：缺必填字段（实测缺 to_user_id → "invalid arguments"；sendtyping 缺 ilink_user_id → "ilink_user_id required"）
+//   ret=-3      报文档位：字段齐全但仍被拒，多为缺少有效的 context_token（新版客户端报文带 context_token）
+//   ret=-4      服务端业务：如 getconfig 无活跃会话 → "GetTypingTicket rpc failed"
 function wxErrorHint(ret) {
-  if (ret === -2) return ' —— 配额用尽或会话不活跃，请在微信里给 clawbot 发任意一条消息刷新后重试';
-  if (ret === -14) return ' —— 登录态无效或已过期：先在微信里给 clawbot 发一条消息激活会话，仍失败则重新扫码绑定';
+  if (ret === -2) return ' —— 参数缺失/无效（必填字段没给全），核对 msg.to_user_id 等字段';
+  if (ret === -3) return ' —— 报文被拒：常见原因是缺少有效的 context_token。请先在微信里给机器人发一条消息激活会话，再重试；或改用客户端原生的「推送到微信」开关';
+  if (ret === -4) return ' —— 服务端业务失败：当前账号没有活跃会话（先给机器人发一条消息）';
+  if (ret === -14) return ' —— 鉴权失败：凭据无效或已过期。若发送头里出现 "[object Object]" 说明读到了加密信封（用 --cred-status 诊断）';
   return '';
 }
 
@@ -155,19 +468,21 @@ const CHANNEL_VERSION = process.env.WBPUSH_WX_CHANNEL_VERSION || DEFAULT_CHANNEL
 async function sendWeixin(text) {
   const creds = loadWeixinCreds();
   if (!creds.botToken || !creds.userId) {
-    throw new Error('未找到微信 ClawBot 凭据（settings.json 中无 enabled 的 weixinClawBot 通道）');
+    const err = new Error(creds.error || '未找到微信 ClawBot 明文凭据（settings.json 中无 enabled 的 weixinClawBot 通道）');
+    err.code = 'CREDENTIAL_UNAVAILABLE';
+    throw err;
   }
-  const payload = {
-    msg: {
-      from_user_id: '',
-      to_user_id: creds.userId,
-      client_id: 'wbpush-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
-      message_type: 2,
-      message_state: 2,
-      item_list: [{ type: 1, text_item: { text: text } }]
-    },
-    base_info: { channel_version: CHANNEL_VERSION }
+  const msg = {
+    from_user_id: '',
+    to_user_id: creds.userId,
+    client_id: 'wbpush-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+    message_type: 2,
+    message_state: 2,
+    item_list: [{ type: 1, text_item: { text: text } }]
   };
+  // 新版 iLink 对缺 context_token 的报文可能返回 ret=-3；有则带上（被动回复场景必须回传）
+  if (creds.contextToken) msg.context_token = creds.contextToken;
+  const payload = { msg: msg, base_info: { channel_version: CHANNEL_VERSION } };
   const body = JSON.stringify(payload);
   let lastErr = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -396,15 +711,17 @@ function buildMediaItem(uploaded, mediaType, fileName) {
 }
 
 async function sendWeixinItems(creds, itemList) {
+  const msg = {
+    from_user_id: '',
+    to_user_id: creds.userId,
+    client_id: 'wbpush-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+    message_type: 2,
+    message_state: 2,
+    item_list: itemList
+  };
+  if (creds.contextToken) msg.context_token = creds.contextToken;
   const body = JSON.stringify({
-    msg: {
-      from_user_id: '',
-      to_user_id: creds.userId,
-      client_id: 'wbpush-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
-      message_type: 2,
-      message_state: 2,
-      item_list: itemList
-    },
+    msg: msg,
     base_info: { channel_version: CHANNEL_VERSION }
   });
   let lastErr = null;
@@ -558,8 +875,8 @@ async function main() {
     }
     const credsF = loadWeixinCreds();
     if (!credsF.botToken || !credsF.userId) {
-      console.error('[wb-push] 未找到微信 ClawBot 凭据（settings.json 中无 enabled 的 weixinClawBot 通道）');
-      process.exit(1);
+      console.error('[wb-push] ' + (credsF.error || '未找到微信 ClawBot 明文凭据'));
+      process.exit(3);
     }
     const mediaType = mode === '--send-image' ? 'image' : inferMediaType(abs);
     const sizeBytes = fs.statSync(abs).size;
@@ -572,13 +889,80 @@ async function main() {
       await push('📎 ' + path.basename(abs), caption);
     }
     console.log('[wb-push] 已发送' + label + ': ' + path.basename(abs));
+  } else if (mode === '--cred-status') {
+    // 诊断凭据解析路径，不打印完整密钥
+    const creds = loadWeixinCreds();
+    const ok = printCredStatus(creds);
+    process.exit(ok ? 0 : 3);
+  } else if (mode === '--session-status') {
+    // 探测会话活跃度：分诊「凭据问题」与「会话未建立」这两个都会表现为收不到消息的成因
+    const credsS = loadWeixinCreds();
+    if (!credsS.botToken) {
+      console.error('[wb-push] ' + (credsS.error || '未找到微信 ClawBot 明文凭据'));
+      process.exit(3);
+    }
+    process.exit(await probeSession(credsS));
+  } else if (mode === '--set-token') {
+    // 手动写入本地凭据缓存：--set-token "<botToken>" [userId]
+    const token = (arg1 || '').trim();
+    if (!BOT_TOKEN_RE.test(token)) {
+      console.error('[wb-push] token 格式不合法，应形如 <accountId>@im.bot:<hex>（当前长度 ' + token.length + '）');
+      process.exit(2);
+    }
+    let userId = (arg2 || '').trim();
+    let baseUrl = DEFAULT_BASE_URL;
+    const ch = readChannelFrom(LIVE_SETTINGS_FILE);
+    if (ch) {
+      if (!userId && typeof ch.userId === 'string') userId = ch.userId;
+      if (typeof ch.baseUrl === 'string' && ch.baseUrl) baseUrl = ch.baseUrl;
+      if (typeof ch.accountId === 'string' && !token.startsWith(ch.accountId + ':')) {
+        console.error('[wb-push] 警告: token 账号前缀与 settings.json 的 accountId(' + ch.accountId + ') 不一致，仍按输入写入');
+      }
+    }
+    if (!userId) {
+      console.error('[wb-push] 缺少 userId，请用 --set-token "<token>" "<userId>" 显式给出');
+      process.exit(2);
+    }
+    writeCredCache({ botToken: token, userId: userId, baseUrl: baseUrl, source: 'manual', updatedAt: new Date().toISOString() });
+    console.log('[wb-push] 已写入凭据缓存: ' + CRED_CACHE_FILE + '（userId=' + userId + '）');
+  } else if (mode === '--recover-token') {
+    // 回收可用明文 token：claw-state 游标优先（当前绑定），其次历史 settings.json* 备份
+    const ch = readChannelFrom(LIVE_SETTINGS_FILE);
+    let acc = ch && typeof ch.accountId === 'string' ? ch.accountId : '';
+    if (!acc && ch && typeof ch.channelId === 'string') acc = ch.channelId;
+    if (!acc) {
+      // 5.6+ 客户端下 accountId 可能缺失，或与 channelId 一样被加密：
+      // 此时允许不带账号校验地扫描游标，取 mtime 最新者并明确告警。
+      console.error('[wb-push] 警告: settings.json 无可读的 accountId，将按最新 mtime 选取 claw-state 游标凭据');
+    }
+    const rec = recoverPlaintextToken(acc);
+    if (!rec) {
+      console.error('[wb-push] 未在 claw-state 游标或历史 settings.json* 备份中找到' + (acc ? ('账号 ' + acc + ' 的') : '') + '明文 token');
+      process.exit(3);
+    }
+    const recUserId = rec.userId || (ch && typeof ch.userId === 'string' ? ch.userId : '');
+    if (!recUserId) {
+      console.error('[wb-push] 来源 ' + rec.file + ' 无 userId，且 settings.json 中亦无，无法写入缓存');
+      process.exit(3);
+    }
+    writeCredCache({
+      botToken: rec.botToken,
+      userId: recUserId,
+      baseUrl: rec.baseUrl || (ch && ch.baseUrl) || DEFAULT_BASE_URL,
+      source: 'recovered:' + rec.file,
+      updatedAt: new Date().toISOString()
+    });
+    console.log('[wb-push] 已回收明文 token：来源 ' + rec.file + '（' + rec.origin + '，mtime ' + new Date(rec.mtime).toISOString() + (acc ? ('，账号 ' + acc) : '') + '）');
+    console.log('[wb-push] 注意：若客户端此后重新扫码绑定过，回收到的 token 可能已轮换——优先依赖自动回收而非缓存。');
   } else {
     console.error('用法: node wb-push.js --hook <EventName> | --send "<标题>" "<内容>" | --send-file "<文件路径>" ["说明文本"]');
+    console.error('      node wb-push.js --cred-status | --session-status | --recover-token | --set-token "<token>" "<userId>"');
     process.exit(2);
   }
 }
 
 main().catch((e) => {
   console.error('[wb-push] 发送失败: ' + e.message);
-  process.exit(1);
+  // 凭据类失败统一退出码 3（区别于网络/协议失败的 1），便于自动化区分处置
+  process.exit(e && e.code === 'CREDENTIAL_UNAVAILABLE' ? 3 : 1);
 });
