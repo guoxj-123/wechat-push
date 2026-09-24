@@ -10,18 +10,11 @@
 
 > ## 📢 v1.2.0 更新（2026-09-24）
 >
-> **修复 WorkBuddy 5.6+ 用户推送失效的问题。**
-> 5.6 起客户端把 `settings.json` 里的凭据改为加密存储，外部脚本无法解密，
-> 旧版会把凭据对象拼成 `Bearer [object Object]`，服务端返回误导性的
-> `errcode=-14 session timeout`，**消息发不出去**。
-> v1.2.0 已自动适配（改从客户端轮询游标取材），**无需手工干预**。
+> **新增 `--hook-status` 入口自检**——排查「收不到消息」时先确认 hook 是否真的执行：
+> 路径若写成反斜杠形式会被 bash 转义吃掉，脚本根本不启动，且**完全静默**（无输出、无日志）。
+> 另修复审计守护进程的性能问题（每 2 秒读取量从 6.6 MB 降至接近 0）。
 >
-> 同时新增 `--cred-status` / `--session-status` 两条诊断命令，
-> 用于区分「凭据解析失败」与「会话未建立」——这两类问题的表现相同、成因不同。
->
-> - 完整变更 → [CHANGELOG.md](CHANGELOG.md)
-> - 所有版本 → [Releases](https://github.com/guoxj-123/wechat-push/releases)
-> - **正在用 1.0.0？** → 见 [更新到新版本](#更新到新版本)
+> 完整变更 → [CHANGELOG.md](CHANGELOG.md)　·　所有版本 → [Releases](https://github.com/guoxj-123/wechat-push/releases)　·　**正在用 1.2.0？** → [更新到新版本](#更新到新版本)
 
 ---
 
@@ -66,8 +59,8 @@
   用配套的审计日志守护进程（`scripts/wb-audit-watch.js`）同样推送到微信
 - 🔑 **自动适配加密凭据**：WorkBuddy 5.6+ 把 `settings.json` 里的凭据改为加密信封，
   外部无法解密。本 skill 会自动改从客户端轮询游标取材，**无需手工处理**
-- 🧭 **内建分诊工具**：`--cred-status` / `--session-status` 两条命令分离
-  「凭据问题」与「会话问题」，不必盲试
+- 🧭 **内建分诊工具**：`--hook-status` / `--cred-status` / `--session-status` 三条命令
+  按「入口 → 凭据 → 会话」分层排查，不必盲试
 - 🔒 **零密钥入仓**：脚本运行时自动读取本机 WorkBuddy 配置（或环境变量），
   仓库内不含任何 token
 - 📚 **协议参考与排障手册**：附 iLink 端点、错误码、平台限额与常见问题整理
@@ -85,6 +78,10 @@ iLink Bot API → 你的微信 ClawBot。
 ```
 
 ---
+
+> 下文 `<skill>` 指本 skill 的安装目录，默认是 `~/.workbuddy/skills/wechat-push/`。
+> 命令一律用 `<skill>/scripts/…` 全路径形式——工作目录不一定是 skill 目录，
+> 裸相对路径会报「Cannot find module」。
 
 ## 安装
 
@@ -126,7 +123,17 @@ WorkBuddy 会自行完成下载、解压、放置。装好后**重启一次 Work
 
 ### 验证安装
 
-安装后，在对话里说一句：
+**第一步：确认入口生效。** 让 WorkBuddy 执行：
+
+```bash
+node <skill>/scripts/wb-push.js --hook-status
+```
+
+它会列出 `settings.json` 中已配置的 hook 事件，并逐个校验命令路径是否存在、是否含
+反斜杠（写成 `C:\Users\…` 会被 bash 当转义符吃掉，脚本根本不会启动，且没有任何报错）。
+**未配置的事件只作提示，不算错误**——`Stop` / `PermissionRequest` 均可按需启用。
+
+**第二步：发一条测试消息。** 在对话里说：
 
 > 用微信 ClawBot 推送，给我发一条「通道已打通」
 
@@ -171,8 +178,7 @@ hook 配置也在那里，均位于 skill 目录之外，覆盖 skill 不会触�
 
 ## 定时任务：优先用客户端原生开关
 
-**这是最容易被忽略的一点。** 如果你的目标是「让定时任务把结果发到微信」，有两条路，
-且优先级不同：
+如果目标是「让定时任务把结果发到微信」，有两条路，优先级不同：
 
 | 需求 | 推荐做法 |
 |------|---------|
@@ -191,7 +197,7 @@ hook 配置也在那里，均位于 skill 目录之外，覆盖 skill 不会触�
 
 | 退出码 | 含义 |
 |--------|------|
-| `0` | 已受理（注意：**受理 ≠ 送达**，见下方「静默失败」） |
+| `0` | 已受理（**受理 ≠ 送达**，见下方「静默失败」） |
 | `1` | 网络 / 协议 / 业务失败 |
 | `2` | 用法错误 |
 | `3` | **凭据不可用**（settings 为加密信封，且无本地缓存 / 可回收备份） |
@@ -200,25 +206,33 @@ hook 配置也在那里，均位于 skill 目录之外，覆盖 skill 不会触�
 
 ## 诊断命令
 
-`wb-push.js` 提供 4 个诊断与维护开关。**它们不打印密钥本身**，可安全用于排查。
+`wb-push.js` 提供 5 个诊断与维护开关。**它们不打印完整密钥**——`botToken` 只显示首尾片段
+（形如 `1234abcd…889f (len 58)`）；但 `userId` 与文件路径为完整输出，贴到公开渠道前请自行遮蔽。
 
 ```bash
-node scripts/wb-push.js --cred-status      # ① 凭据解析路径
-node scripts/wb-push.js --session-status   # ② 会话活跃度（能否真正投递）
-node scripts/wb-push.js --recover-token    # ③ 从 claw-state / 历史备份回收凭据写入缓存
-node scripts/wb-push.js --set-token "<token>" "<userId>"   # ④ 手工写入凭据缓存
+node <skill>/scripts/wb-push.js --hook-status      # ⓪ 入口自检：hook 配置与命令路径
+node <skill>/scripts/wb-push.js --cred-status      # ① 凭据解析路径
+node <skill>/scripts/wb-push.js --session-status   # ② 会话活跃度（能否真正投递）
+node <skill>/scripts/wb-push.js --recover-token    # ③ 从 claw-state / 历史备份回收凭据写入缓存
+node <skill>/scripts/wb-push.js --set-token "<token>" "<userId>"   # ④ 手工写入凭据缓存
 ```
 
-**「收不到消息」按四步分诊，不要跳步：**
+**「收不到消息」按五步分诊，先确认入口：**
 
 | 步骤 | 命令 / 判据 | 结论 |
 |------|------------|------|
+| ⓪ **入口是否生效** | `--hook-status` | 报「未配置任何 hook」或「路径含反斜杠」→ 修正 `settings.json` |
 | ① 凭据是否解析成功 | `--cred-status` | 来源为 `none` → 凭据问题 |
 | ② 凭据是否被服务端认可 | 看 `--send` 是否返回 `errcode=-14` | 返回 `-14` → 凭据无效/格式错 |
 | ③ **会话是否存在** | `--session-status` | `ret=0` 可投递；`ret=-4` **无活跃会话，消息必被丢弃** |
 | ④ 内容是否超长 | 统计正文字符数 | >1500 → 静默截断，改分段 |
 
-**第 ③ 步最容易被漏掉**：凭据有效、接口返回 [`message_id`]，消息仍可能不投递。
+第 ⓪ 步具有前置性：hook 未执行时，凭据与会话再正常也不会有消息，而它**完全静默**——
+无输出、无日志。若 `--hook-status` 通过、且已配置 `Stop`，但
+`~/.workbuddy/wb-push.state.json` 始终不生成，查 `~/.workbuddy/wb-push.debug.log`
+是否留有 error 条目。
+
+**第 ③ 步常被跳过**：凭据有效、接口返回 [`message_id`]，消息仍可能不投递。
 `ret=-4` 时依次处理：让用户在微信里给 `clawbot` 发一条消息 → 仍不行则
 **在 WorkBuddy 中重新扫码绑定**（绑定完成后 `--cred-status` 会自动取到新凭据）。
 
@@ -226,12 +240,27 @@ node scripts/wb-push.js --set-token "<token>" "<userId>"   # ④ 手工写入凭
 
 1. 环境变量 `WBPUSH_WX_TOKEN` / `WBPUSH_WX_USER`
 2. 本地凭据缓存 `~/.workbuddy/wb-push.credentials.json`（写入权限 `0600`）
-3. `~/.workbuddy/settings.json` 中的**明文**凭据（旧版客户端）
+3. `~/.workbuddy/settings.json` 中的**明文**凭据（客户端明文存储时）
 4. **claw-state 轮询游标**（加密客户端下的主用来源）
 5. 自动回收：从历史 `settings.json*` 备份中查找最新明文凭据
 
 第 4、5 条均做**账号一致性校验**：重新扫码绑定会更换 `accountId`，旧来源会被拒绝，
 而 claw-state 会立即给出新账号的凭据。
+
+`context_token` 仅在环境变量 `WBPUSH_WX_CONTEXT_TOKEN` 或凭据缓存中显式提供时才携带；
+从 claw-state 与备份回收的凭据不含它（`--cred-status` 的 `context` 行显示「无」）。
+实测服务端当前接受缺省；若将来变为强制，发送会返回 `ret=-3`。
+
+**运行时产物**（均在 `~/.workbuddy/` 下，位于 skill 目录之外，可随时删除，脚本会自动重建）：
+
+| 文件 | 用途 | 上限 |
+|------|------|------|
+| `wb-push.credentials.json` | 凭据缓存（权限 `0600`） | — |
+| `wb-push.state.json` | Stop 的 5 分钟节流状态 | — |
+| `wb-push.debug.log` | hook 事件 payload 与失败记录（含 `tool_input` 原文） | 200 KB |
+| `wb-audit-watch.log` | 守护进程运行日志 | 512 KB |
+| `wb-audit-watch.state.json` | 去重集合与文件签名缓存 | seen ≤ 800 |
+| `wb-audit-watch.lock` | 守护进程单实例锁 | — |
 
 ---
 
@@ -239,14 +268,14 @@ node scripts/wb-push.js --set-token "<token>" "<userId>"   # ④ 手工写入凭
 
 ```bash
 # 手动发送一条测试
-node scripts/wb-push.js --send "测试标题" "测试内容"
+node <skill>/scripts/wb-push.js --send "测试标题" "测试内容"
 
 # 推送图片 / 文件
-node scripts/wb-push.js --send-image "C:/path/pic.png" "配图"
-node scripts/wb-push.js --send-file  "C:/path/report.xlsx" "周报"
+node <skill>/scripts/wb-push.js --send-image "C:/path/pic.png" "配图"
+node <skill>/scripts/wb-push.js --send-file  "C:/path/report.xlsx" "周报"
 
 # 推送长文本（>1500 字，自动分段）
-python scripts/wb-push-long.py "report.md" --title "日报"
+python <skill>/scripts/wb-push-long.py "report.md" --title "日报"
 ```
 
 ## 配置自动推送（hooks）
@@ -269,13 +298,13 @@ hook 命令由 **Git Bash** 执行，其子进程**继承 WorkBuddy 进程的 PA
 }
 ```
 
-> ⚠️ **唯一需要注意的地方是反斜杠**：`C:\Users\...` 里的反斜杠会被 bash 当转义符吃掉，
+> ⚠️ **反斜杠是唯一的失败点**：`C:\Users\...` 里的反斜杠会被 bash 当转义符吃掉，
 > 导致 exit 127 静默失败。必须写成「正斜杠 + 双引号」。
 >
 > 若 `node` 找不到（罕见），退回绝对路径
 > `~/.workbuddy/binaries/node/versions/<版本>/node.exe`；但绝对路径会随 Node 升级失效。
 >
-> **注意**：`node` 只在 **WorkBuddy 内部**（智能体 / hook）可用。你自己开 cmd 或
+> `node` 只在 **WorkBuddy 内部**（智能体 / hook）可用。你自己开 cmd 或
 > PowerShell 跑 `wb-push.js` 时 `node` 会报「不是内部或外部命令」——因为内置 Node
 > 不在持久的系统 PATH 里。这正是本 skill 使用内置 Node、而非要求用户安装 Node 的原因。
 
@@ -288,16 +317,16 @@ hook 命令由 **Git Bash** 执行，其子进程**继承 WorkBuddy 进程的 PA
 
 ## 排障
 
-⚠️ **先读这一点**：本通道有**三种静默失败**，其共同特征是
-**脚本显示「已发送」、退出码为 0，但你手机上收不到**。因此
-**「已发送」不等于送达**——唯一可靠的确认是你亲眼看到。
-按上方 [诊断命令](#诊断命令) 的四步分诊定位。
+⚠️ **本通道有三种静默失败**，其共同特征是
+**脚本显示「已发送」、退出码为 0，但手机上收不到**。因此
+**「已发送」不等于送达**——唯一可靠的确认是在微信中实际看到该消息。
+按上方 [诊断命令](#诊断命令) 的五步分诊定位。
 
 | 现象 | 原因 / 处理 |
 |------|-------------|
 | 完全收不到 | 检查 hook 路径是否用了正斜杠（反斜杠会被 bash 吃掉）；再用 `--cred-status` 看凭据是否解析成功 |
 | `ret=-2 prepare failed` | 主动推送配额用尽或会话过期 → 让用户给微信 clawbot 发任意消息刷新。注意 `ret=-2` **不专指配额**，参数缺失也可能返回它 |
-| `errcode=-14 session timeout` | 鉴权错误走 `errcode`、业务错误走 `ret`，是两套字段。**别急着重新扫码**：先用 `--cred-status` 看凭据来源——请求头里塞进非字符串 token（如读到 `$wbEncrypted` 信封 → `Bearer [object Object]`）也会报这个错 |
+| `errcode=-14 session timeout` | 鉴权错误走 `errcode`、业务错误走 `ret`，是两套字段。**不要直接重新扫码**：先用 `--cred-status` 看凭据来源——请求头中的 token 非字符串（如误将 `$wbEncrypted` 信封当作 token，拼出 `Bearer [object Object]`）也会报该错，其文案与实际成因不符 |
 | 脚本显示「已发送」，微信却没收到 | 三种静默失败：① 凭据/登录态无效；② 会话不活跃或**会话根本未建立**（换绑后常见）；③ 超 1500 字被静默截断。分诊顺序见上 |
 | 发了几条后突然断 | 账号限速约 7 条/5 分钟，单会话配额约 10 条，稍等或刷新会话 |
 | 手动 `--send` 能收到，但「任务完成」收不到 | 会话不活跃时 `sendmessage` 仍返回 `message_id`（不报错）但消息**不投递**；脚本会误记 `lastStopPushAt`，导致后续 Stop 被 5 分钟节流跳过。处理：① 让用户给微信 clawbot 发任意消息激活会话；② 清空 `~/.workbuddy/wb-push.state.json`（内容写 `{}`）解除节流 |

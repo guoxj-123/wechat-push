@@ -11,7 +11,8 @@
  *   内容也支持从 stdin 读取
  *
  * 用法3（凭据与投递诊断）:
- *   node wb-push.js --cred-status           # 诊断凭据解析路径（不打印密钥）
+ *   node wb-push.js --hook-status           # 自检 settings.json 的 hooks 配置（入口层）
+ *   node wb-push.js --cred-status           # 诊断凭据解析路径（密钥仅显示首尾片段）
  *   node wb-push.js --session-status        # 探测会话活跃度（getconfig），判断能否真正投递
  *   node wb-push.js --set-token "<token>" [userId]   # 手动写入本地凭据缓存
  *   node wb-push.js --recover-token         # 从 claw-state/历史 settings.json* 回收明文 token
@@ -22,7 +23,7 @@
  *     1) 环境变量 WBPUSH_WX_TOKEN / WBPUSH_WX_USER / WBPUSH_WX_BASE
  *        （可选 WBPUSH_WX_CONTEXT_TOKEN，被动回复场景需要）
  *     2) 本地凭据缓存 ~/.workbuddy/wb-push.credentials.json（0600）
- *     3) ~/.workbuddy/settings.json 中的明文凭据（旧版客户端仍为明文）
+ *     3) ~/.workbuddy/settings.json 中的明文凭据（客户端未启用加密存储时）
  *     4) claw-state 长轮询游标 ~/.workbuddy/claw-state/weixin/<accountId>_im.bot.cursor.json
  *        该文件内嵌当前绑定的 <accountId>@im.bot:<hex> 身份串（于 get_updates_buf 的
  *        base64 里），格式与 botToken 同构，由客户端每轮 getupdates 刷新——无需解密，
@@ -30,12 +31,16 @@
  *     5) 自动恢复：从历史 settings.json* 备份回收最新的明文 botToken（仅当账号一致）
  *
  *   ⚠️ WorkBuddy 5.6+ 把 settings.json 的 botToken / channelId 改为加密信封
- *      {"$wbEncrypted":1,"envelope":"<base64>"}。密钥由客户端原生层
- *      （WorkBuddy.exe!electron_browser_workbuddy_storage）在启动时通过
- *      IPC 下发给 CLI，外部脚本无法获取，故无法解密。
- *      旧版脚本会把对象直接拼进请求头，得到 "Bearer [object Object]"，iLink
- *      返回误导性的 errcode=-14 session timeout。本版改为显式识别信封并报错，
- *      并优先经第 4 条（claw-state）自动取得当前绑定的有效凭据。
+ *      {"$wbEncrypted":1,"envelope":"<base64>"}。密钥由客户端原生层经 IPC 下发给
+ *      CLI，外部脚本无法获取，故无法解密。脚本对此显式识别并报错，改由第 4 条
+ *      （claw-state 游标）自动取得当前绑定的有效凭据。
+ *      若把信封对象直接拼进请求头，会得到 "Bearer [object Object]"，
+ *      iLink 返回 errcode=-14 session timeout —— 该文案与实际成因不符。
+ *
+ * 调试日志：~/.workbuddy/wb-push.debug.log
+ *   hook 由 WorkBuddy 在后台调用，其输出用户不可见。本文件记录 hook 事件的原始
+ *   payload 与失败原因，用于排查「入口静默失效」。上限 200 KB，超出后保留最近一半。
+ *   可用 `--hook-status` 快速判断入口配置；确认无需追溯时可随时删除本文件。
  */
 
 const fs = require('fs');
@@ -177,7 +182,7 @@ function recoverPlaintextToken(expectedAccount) {
 //   ret=0            → 会话活跃，主动推送可投递
 //   ret=-4           → 该 bot 下无活跃会话，主动推送会被静默丢弃（sendmessage 仍返回 message_id）
 //   errcode=-14      → 凭据本身无效（先跑 --cred-status）
-// 注意：requestDeliveries 只记录文件/产物投递，不能用来判断文本会话是否活跃。
+// requestDeliveries 只记录文件/产物投递，不能用来判断文本会话是否活跃。
 async function probeSession(creds) {
   const body = JSON.stringify({
     ilink_user_id: creds.userId,
@@ -340,7 +345,7 @@ function loadWeixinCreds() {
   };
 }
 
-// 打印凭据诊断（不含密钥）
+// 打印凭据诊断（botToken 遮蔽为「前 8 位…后 4 位」，userId 完整显示）
 function printCredStatus(creds) {
   const mask = (t) => (!t ? '(空)' : t.length <= 12 ? t : t.slice(0, 8) + '…' + t.slice(-4) + ' (len ' + t.length + ')');
   console.log('[wb-push] 凭据解析路径:');
@@ -352,6 +357,111 @@ function printCredStatus(creds) {
   console.log('  context : ' + (creds.contextToken ? '有' : '无'));
   if (!creds.botToken) console.log('\n' + creds.error);
   return !!creds.botToken;
+}
+
+// ---------- 调试日志（hook 事件的 payload 与失败留痕） ----------
+// hook 由 WorkBuddy 在后台调用，其 stdout/stderr 对用户不可见——入口层故障
+// （命令路径被 bash 转义吃掉、凭据不可用等）因此完全静默、无迹可查。
+// 这里把 hook 事件的原始 payload 与失败原因落到 debug 日志，供事后回溯。
+const DEBUG_LOG_FILE = path.join(WB_DIR, 'wb-push.debug.log');
+const DEBUG_LOG_MAX = 200 * 1024;
+
+function debugLog(obj) {
+  try {
+    let old = '';
+    try { old = fs.readFileSync(DEBUG_LOG_FILE, 'utf8'); } catch (e) { /* 不存在 */ }
+    if (old.length > DEBUG_LOG_MAX) old = old.slice(-Math.floor(DEBUG_LOG_MAX / 2));
+    fs.writeFileSync(DEBUG_LOG_FILE, old + JSON.stringify(obj) + '\n');
+  } catch (e) { /* 忽略 */ }
+}
+
+// ---------- hook 配置自检（--hook-status） ----------
+// 入口层的故障是静默的：hook 未配置、或命令里的路径被 bash 转义吃掉
+// （写成 C:\Users\… 会使路径失效，exit 127 且无任何输出）。此时无论后面
+// 的凭据与会话多么正常，用户都收不到消息，且排查方向完全错误。
+// 本命令在排查「收不到消息」之前先确认入口本身是通的。
+const HOOK_EVENT_HINT = {
+  Stop: '每轮对话结束推送「✅ 任务完成」（受 5 分钟节流）',
+  PermissionRequest: '高风险操作需确认时推送',
+  Notification: '权限提示类通知（按高风险规则过滤）'
+};
+
+function checkHooks() {
+  let settings;
+  try {
+    settings = JSON.parse(fs.readFileSync(LIVE_SETTINGS_FILE, 'utf8'));
+  } catch (e) {
+    console.log('[wb-push] hook 自检: 无法读取 ' + LIVE_SETTINGS_FILE);
+    console.log('  ' + e.message);
+    return 3;
+  }
+  const hooks = settings.hooks || {};
+  const events = Object.keys(hooks);
+  console.log('[wb-push] hook 配置自检');
+  console.log('  配置文件  : ' + LIVE_SETTINGS_FILE);
+  console.log('  已配置事件: ' + (events.length ? events.join(', ') : '（无）'));
+
+  let problems = 0;
+  if (!events.length) {
+    console.log('  ✗ 未配置任何 hook —— 自动推送不会被触发');
+    problems++;
+  }
+
+  for (const ev of events) {
+    const groups = Array.isArray(hooks[ev]) ? hooks[ev] : [hooks[ev]];
+    console.log('  [' + ev + ']');
+    for (const g of groups) {
+      for (const h of ((g && g.hooks) || [])) {
+        const cmd = String(h.command || '');
+        console.log('    command: ' + cmd);
+        // ① 反斜杠：bash 会把 \U 之类当转义符吃掉，路径失效 → exit 127 且无输出
+        if (/[A-Za-z]:\\/.test(cmd)) {
+          console.log('      ✗ 路径含反斜杠 —— bash 会当转义符吃掉，导致静默失败（exit 127）。');
+          console.log('        改为正斜杠形式：' + cmd.replace(/\\/g, '/'));
+          problems++;
+        }
+        // ② 路径存在性
+        const paths = cmd.match(/[A-Za-z]:[\\/][^"'\s]*/g) || [];
+        if (!paths.length) {
+          console.log('      · 未识别到绝对路径（依赖 PATH 上的 node 时属正常）');
+        }
+        for (const p of paths) {
+          const norm = p.replace(/\\/g, '/');
+          if (fs.existsSync(norm)) {
+            console.log('      ✓ 存在: ' + norm);
+          } else {
+            console.log('      ✗ 不存在: ' + norm);
+            problems++;
+          }
+        }
+        // ③ 事件参数与所在事件是否一致
+        if (cmd.indexOf('--hook ' + ev) === -1) {
+          console.log('      ✗ 命令里没有 "--hook ' + ev + '"，参数与事件名不一致');
+          problems++;
+        }
+      }
+    }
+  }
+
+  const missing = Object.keys(HOOK_EVENT_HINT).filter((e) => events.indexOf(e) === -1);
+  if (missing.length) {
+    console.log('  未配置的事件（按需启用，不配不影响已配置的推送）:');
+    for (const e of missing) console.log('    · ' + e + ' —— ' + HOOK_EVENT_HINT[e]);
+  }
+
+  if (events.indexOf('Stop') !== -1) {
+    const st = loadState();
+    if (st.lastStopPushAt) {
+      console.log('  Stop 最近一次成功推送: ' + new Date(st.lastStopPushAt).toISOString());
+    } else {
+      console.log('  ! Stop 已配置，但尚无成功推送记录（' + STATE_FILE + ' 无 lastStopPushAt）');
+      console.log('    刚配置完尚未触发属正常；否则检查上面的路径与反斜杠问题，');
+      console.log('    并查看 ' + DEBUG_LOG_FILE + ' 是否记录了 error 条目');
+    }
+  }
+
+  console.log('  自检结果: ' + (problems ? (problems + ' 处问题需处理') : '未发现问题'));
+  return problems ? 1 : 0;
 }
 
 // ---------- 工具 ----------
@@ -458,7 +568,7 @@ function isHighRisk(toolName, toolInput) {
 // 因此它不是失效风险点，无需在运行时去读客户端安装版本。
 //
 // WorkBuddy 客户端内置实现（cli/dist/codebuddy.js 的 WechatApi.buildBaseInfo）
-// 当前使用 'cbc-1.0.0'。这里保持与之对齐；万一将来服务端开始校验，
+// 当前使用 'cbc-1.0.0'。这里保持与之对齐；若服务端将来开始校验，
 // 可用环境变量覆盖而不必改代码：
 //   WBPUSH_WX_CHANNEL_VERSION=cbc-1.0.0
 const DEFAULT_CHANNEL_VERSION = 'cbc-1.0.0';
@@ -787,16 +897,8 @@ async function main() {
     try { if (raw.trim()) p = JSON.parse(raw); } catch (e) { /* 忽略解析错误 */ }
     const ev = arg1 || 'Unknown';
 
-    // 调试捕获：记录 PermissionRequest / Notification 的原始 payload（排查过滤规则用，限 200KB）
-    if (ev === 'PermissionRequest' || ev === 'Notification') {
-      try {
-        const dbg = path.join(os.homedir(), '.workbuddy', 'wb-push.debug.log');
-        let old = '';
-        try { old = fs.readFileSync(dbg, 'utf8'); } catch (e) { /* 不存在 */ }
-        if (old.length > 200 * 1024) old = old.slice(-100 * 1024);
-        fs.writeFileSync(dbg, old + JSON.stringify({ at: new Date().toISOString(), ev, payload: p }) + '\n');
-      } catch (e) { /* 忽略 */ }
-    }
+    // 记录原始 payload（排查过滤规则用；位置与上限见 debugLog）
+    debugLog({ at: new Date().toISOString(), ev, payload: p });
 
     let title = 'WorkBuddy 通知';
     let desp = '';
@@ -889,6 +991,9 @@ async function main() {
       await push('📎 ' + path.basename(abs), caption);
     }
     console.log('[wb-push] 已发送' + label + ': ' + path.basename(abs));
+  } else if (mode === '--hook-status') {
+    // 自检入口层：hook 是否配置、命令路径是否会被 bash 转义吃掉
+    process.exit(checkHooks());
   } else if (mode === '--cred-status') {
     // 诊断凭据解析路径，不打印完整密钥
     const creds = loadWeixinCreds();
@@ -953,16 +1058,21 @@ async function main() {
       updatedAt: new Date().toISOString()
     });
     console.log('[wb-push] 已回收明文 token：来源 ' + rec.file + '（' + rec.origin + '，mtime ' + new Date(rec.mtime).toISOString() + (acc ? ('，账号 ' + acc) : '') + '）');
-    console.log('[wb-push] 注意：若客户端此后重新扫码绑定过，回收到的 token 可能已轮换——优先依赖自动回收而非缓存。');
+    console.log('[wb-push] 回收到的 token 是静态时点快照：若客户端此后重新扫码绑定过，它可能已轮换。'
+      + '日常以自动回收为准，缓存仅作兜底。');
   } else {
     console.error('用法: node wb-push.js --hook <EventName> | --send "<标题>" "<内容>" | --send-file "<文件路径>" ["说明文本"]');
-    console.error('      node wb-push.js --cred-status | --session-status | --recover-token | --set-token "<token>" "<userId>"');
+    console.error('      node wb-push.js --hook-status | --cred-status | --session-status | --recover-token | --set-token "<token>" "<userId>"');
     process.exit(2);
   }
 }
 
 main().catch((e) => {
   console.error('[wb-push] 发送失败: ' + e.message);
+  // hook 模式下的失败对用户不可见，落一条 error 到 debug 日志供事后回溯
+  if (process.argv[2] === '--hook') {
+    debugLog({ at: new Date().toISOString(), ev: process.argv[3] || 'Unknown', error: e.message });
+  }
   // 凭据类失败统一退出码 3（区别于网络/协议失败的 1），便于自动化区分处置
   process.exit(e && e.code === 'CREDENTIAL_UNAVAILABLE' ? 3 : 1);
 });

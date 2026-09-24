@@ -136,8 +136,8 @@ POST /ilink/bot/getuploadurl
 - 图片：`type=2` → `image_item: { media, mid_size: <filesize> }`
 - 视频：`type=5` → `video_item: { media, video_size: <filesize> }`
 - 文件：`type=4` → `file_item: { media, file_name, len: String(rawsize) }`
-- 注意：`aes_key` 是 **base64(hex 字符串)**（32 字符 hex → base64），
-  不是 base64(原始 16 字节)。接收方向两种编码都存在，发送方向统一用前者。
+- `aes_key` 是 **base64(hex 字符串)**（32 字符 hex → base64），不是 base64(原始 16 字节)。
+  接收方向两种编码都存在，发送方向统一用前者。
 
 ### getupdates（长轮询收消息，默认超时 35s）
 
@@ -166,20 +166,22 @@ POST /ilink/bot/getupdates
 两类错误不会同时出现；成功时返回 `ret:0` **且**带 `message_id`。
 排查时必须**两个字段都看**——只看 `ret` 会把鉴权错误读成成功。
 
-### `ret`（业务错误）
+### `ret`（业务错误，实测口径）
 
 | ret | 含义 | 处理 |
 |-----|------|------|
 | 0 / 缺失 | 成功（需配合 `message_id` 判断） | — |
-| -2 | 限流 或 配额耗尽 / 会话过期（两者报错相同） | 等 4 秒重试；仍失败则需用户给 bot 发消息刷新 |
-| -14 | 会话过期（登录态丢失） | 重新扫码登录 |
+| -2 | **不专指配额**：限流 / 配额耗尽 / 会话过期 / **参数缺失**（实测缺 `to_user_id` 返回 `invalid arguments`） | 结合 `errmsg` 判读；限流类等 4 秒重试，参数类核对字段 |
+| -3 | **报文档位**：字段齐全仍被拒。实测三种诱因：① 缺有效 `context_token`；② 用的是已换绑 / 退役账号的 token；③ `message_type` / `item_list` 枚举不符 | 先给 bot 发消息激活会话；确认 token 归属账号与当前 `accountId` 一致 |
+| -4 | **业务层**：该 bot 下没有活跃会话（`getconfig` 探测返回 `GetTypingTicket rpc failed`） | 让用户给 bot 发一条消息；仍不行则重新扫码绑定 |
+| -14 | 会话过期（登录态丢失） | **先确认凭据来源，不要直接重新扫码**——claw-state 游标会自动提供当前绑定的凭据 |
 
 ### `errcode`（鉴权 / 会话错误）
 
 | errcode | errmsg | 含义 | 处理 |
 |---------|--------|------|------|
 | 0 | — | 成功（可能不带 `message_id`） | — |
-| -14 | `session timeout` | botToken 无效 / 已过期，或登录态失效。**也会在「请求头里的 token 不是字符串」时出现**——例如 WorkBuddy 5.6+ 的 `settings.json` 把 `botToken` 存成 `$wbEncrypted` 信封，脚本未识别就拼出了 `Bearer [object Object]`，此时错误文案会误导排查方向 | 先确认凭据解析来源（`wb-push.js --cred-status`），别急着重新扫码；若确为凭据过期，再让用户给 bot 发条消息，仍失败才重新扫码绑定 |
+| -14 | `session timeout` | botToken 无效 / 已过期，或登录态失效。**也会在「请求头中的 token 非字符串」时出现**——例如 WorkBuddy 5.6+ 的 `settings.json` 把 `botToken` 存成 `$wbEncrypted` 信封，若未识别即拼出 `Bearer [object Object]`，其错误文案与实际成因不符 | 先确认凭据解析来源（`wb-push.js --cred-status`），不要直接重新扫码；若确为凭据过期，再让用户给 bot 发条消息，仍失败才重新扫码绑定 |
 
 对照示例（payload 与请求头**完全同构**，唯一变量是 botToken 是否有效）：
 
@@ -200,13 +202,13 @@ POST /ilink/bot/getupdates
 - 账号级限速约 **7 条 / 5 分钟**（所有客户端共享）。
 - 用户给 bot 发任意消息即刷新配额 / 活跃状态。
 
-> 注：`ret=-2` 无法区分「限流」与「配额耗尽」，两者表现一致。
-> 这些限制是平台级规则，无法从客户端脚本侧绕过。
+> 注：`ret=-2` 无法区分「限流」与「配额耗尽」，两者表现一致；参数缺失同样返回该码
+> （见上表）。这些限制是平台级规则，无法从客户端脚本侧绕过。
 
 ### ⚠️ 会话不活跃时的「静默不投递」
 
 会话不活跃（用户近 24h 未给 bot 发消息）时，`sendmessage` **可能仍返回
-`message_id`（不报错）**，但消息不会真正投递到用户微信——这是该通道最需注意的一点：
+`message_id`（不报错）**，但消息不会真正投递到用户微信——这是该通道的核心特征：
 无法从返回值判断是否送达。
 
 对 `wb-push.js` 的影响：脚本会把这种「假成功」当作成功并写入

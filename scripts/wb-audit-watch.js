@@ -6,8 +6,11 @@
  * 当出现「*.needs-approval」事件（如 file-safety.bulk-delete.needs-approval，
  * 即批量删除防护弹窗）时，立即通过 wb-push.js 推送到用户微信。
  *
- * 设计：每 2 秒全量读取所有 jsonl（文件都很小），按事件哈希去重。
- * 不依赖文件偏移——spool 文件会被审计系统频繁重写/合并，偏移追踪不可靠。
+ * 设计：每 2 秒扫描 jsonl，按事件哈希去重。不依赖文件偏移——spool 文件会被
+ * 审计系统频繁重写/合并，偏移追踪不可靠。改用「文件 mtime+size 签名」缓存：
+ * 往期日账一旦写入就不再变化，可整体跳过；spool 文件 mtime 变化，仍会重扫。
+ * 审计目录随使用天数线性增长（实测 45 天已 6.8 MB），若无条件全量重读，
+ * 每 2 秒的解析量会随时间单调上升。
  *
  * 用法:
  *   node wb-audit-watch.js            # 常驻轮询（每 2 秒）
@@ -15,8 +18,8 @@
  *   node wb-audit-watch.js --reset    # 只初始化（把现有事件标记为已见，不推送）
  *   环境变量 WB_AUDIT_DIR 可覆盖审计目录（测试用）
  *
- * 日志: ~/.workbuddy/wb-audit-watch.log
- * 状态: ~/.workbuddy/wb-audit-watch.state.json（seen 事件 id 集合）
+ * 日志: ~/.workbuddy/wb-audit-watch.log（上限 512 KB，超出后保留最近一半）
+ * 状态: ~/.workbuddy/wb-audit-watch.state.json（seen 事件 id 集合 + 文件签名缓存）
  */
 
 const fs = require('fs');
@@ -29,21 +32,31 @@ const STATE_FILE = path.join(os.homedir(), '.workbuddy', 'wb-audit-watch.state.j
 const LOCK_FILE = path.join(os.homedir(), '.workbuddy', 'wb-audit-watch.lock');
 const LOG_FILE = path.join(os.homedir(), '.workbuddy', 'wb-audit-watch.log');
 // 与 wb-push.js 同处 scripts/ 目录，用 __dirname 定位，不依赖 skill 的安装位置。
-// 注意：不要改用 HOME 下的绝对路径——skill 可被安装到任意目录。
+// 不使用 HOME 下的绝对路径：skill 可被安装到任意目录。
 const WB_PUSH = path.join(__dirname, 'wb-push.js');
 const POLL_MS = 2000;
 const MAX_SEEN = 800;
-const VERSION = 'v3';
+const LOG_MAX_BYTES = 512 * 1024;
+const VERSION = 'v4';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function log(msg) {
   const line = '[' + new Date().toISOString() + '] ' + msg;
-  try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch (e) { /* 忽略 */ }
+  try {
+    let size = 0;
+    try { size = fs.statSync(LOG_FILE).size; } catch (e) { /* 文件尚不存在 */ }
+    if (size > LOG_MAX_BYTES) {
+      // 超限时保留最近一半，避免常驻进程无限增长
+      const old = fs.readFileSync(LOG_FILE, 'utf8');
+      fs.writeFileSync(LOG_FILE, old.slice(-Math.floor(LOG_MAX_BYTES / 2)));
+    }
+    fs.appendFileSync(LOG_FILE, line + '\n');
+  } catch (e) { /* 忽略 */ }
   console.log(line);
 }
 
-// ---------- 单实例锁（带版本，可自动接管旧版本） ----------
+// ---------- 单实例锁（带版本，可自动接管旧版本进程） ----------
 function acquireLock() {
   try {
     const old = fs.readFileSync(LOCK_FILE, 'utf8').trim();
@@ -127,11 +140,20 @@ function buildMessage(ev) {
   };
 }
 
-function scanAll(state, pushEnabled) {
+function scanAll(state, pushEnabled, force) {
   let pushedCount = 0;
-  for (const f of listJsonl(AUDIT_DIR)) {
+  if (!state.fileCache) state.fileCache = {};
+  const files = listJsonl(AUDIT_DIR);
+  for (const f of files) {
+    // 文件签名（mtime+size）未变则整体跳过：往期日账写入后不再变化，
+    // spool 文件被频繁重写故签名会变。reset 模式传 force 以强制全量。
+    let st;
+    try { st = fs.statSync(f); } catch (e) { continue; }
+    const sig = st.mtimeMs + ':' + st.size;
+    if (!force && state.fileCache[f] === sig) continue;
     let text = '';
     try { text = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    state.fileCache[f] = sig;
     for (const line of text.split('\n')) {
       const t = line.trim();
       if (!t) continue;
@@ -157,6 +179,10 @@ function scanAll(state, pushEnabled) {
       if (ev.id) state.seen[ev.id] = Date.now();
       state.seen[hashKey] = Date.now();
     }
+  }
+  // 清理已消失文件的签名缓存，避免状态文件无限增长
+  for (const k of Object.keys(state.fileCache)) {
+    if (files.indexOf(k) === -1) delete state.fileCache[k];
   }
   // 修剪 seen
   if (state.seen) {
@@ -185,7 +211,7 @@ async function main() {
   log('守护启动（' + VERSION + '），审计目录: ' + AUDIT_DIR + (reset ? '（reset 模式）' : ''));
   if (reset) {
     const state = loadState();
-    scanAll(state, false);
+    scanAll(state, false, true);   // 强制全量：忽略文件签名缓存
     saveState(state);
     log('reset 完成');
     return;
