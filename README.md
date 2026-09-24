@@ -2,7 +2,7 @@
 
 > 让 WorkBuddy 的任务进展，直达你的微信 📱
 
-[![version](https://img.shields.io/badge/version-1.2.0-blue)](https://github.com/guoxj-123/wechat-push/releases)
+[![version](https://img.shields.io/github/v/release/guoxj-123/wechat-push?label=version&color=blue)](https://github.com/guoxj-123/wechat-push/releases)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![platform](https://img.shields.io/badge/platform-WorkBuddy-lightgrey)
 
